@@ -254,7 +254,7 @@ class Entity:
                 "sw_version": self.node.sw_version or "",
                 "hw_version": self.node.hw_version or "",
                 "manufacturer": "mrk",
-                "model": "esphome-canopen",
+                "model": self.node.device_info.get("model_name", "CANopen Device"),
             },
         }
         cfg.update(self.PROPS)
@@ -288,10 +288,10 @@ class Entity:
             value = value.decode("utf-8")
         name = self.METADATA_PROPERTIES.get(key)
         if name:
-            logger.debug("\t%s %s: %s", name, key, value)
+            logger.debug("	%s %s: %s", name, key, value)
             self.set_property(name, value)
         else:
-            logger.warning("\tunknown metadata property %s: %s", key, value)
+            logger.warning("	unknown metadata property %s: %s", key, value)
 
     async def mqtt_initial_publish(self, _mqtt_client):
         pass
@@ -315,71 +315,6 @@ class EntityRegistry:
         return cls._by_type[(type_id, version)](
             node, entity_index, mqtt_topic_prefix, caps
         )
-
-
-@EntityRegistry.register
-class Update(Entity):
-    TYPE_ID = 255
-    TYPE_NAME = "update"
-    STATES = [
-        ("state_topic", str, str),
-    ]
-
-    disable_upload = False
-    flags = 0
-
-    def get_state_topic(self):
-        return f"{self.mqtt_topic_prefix}/node_state_{self.node.id:03x}/update"
-
-    def get_json_attributes_topic(self):
-        return f"{self.mqtt_topic_prefix}/node_json_attr_{self.node.id:03x}/update"
-
-    def get_command_topic(self):
-        return (
-            f"{self.mqtt_topic_prefix}/node_cmd_{self.node.id:03x}/update/{self.flags}"
-        )
-
-    def get_mqtt_config(self):
-        config = super().get_mqtt_config()
-        config["state_topic"] = self.get_state_topic()
-        config["json_attributes_topic"] = self.get_json_attributes_topic()
-
-        config["device_class"] = "firmware"
-        config["name"] = "Update"
-        config["icon"] = "mdi:file-download-outline"
-        if not self.disable_upload:
-            config["command_topic"] = self.get_command_topic()
-        config["payload_install"] = "install"
-        return config
-
-    async def publish_version(self, mqtt_client, ver):
-        state_topic = self.get_state_topic()
-        json_attr_topic = self.get_json_attributes_topic()
-        payload = json.dumps(
-            {
-                "installed_version": self.node.sw_version,
-                "latest_version": ver or self.node.sw_version,
-            }
-        )
-        logger.info("publish_version: %s", payload)
-        await mqtt_client.publish(state_topic, payload=payload, retain=False)
-        await mqtt_client.publish(json_attr_topic, payload=payload, retain=False)
-
-    async def mqtt_initial_publish(self, mqtt_client):
-        await self.publish_version(mqtt_client, None)
-
-    async def publish_progress(self, mqtt_client, pos, size):
-        if not size:
-            return
-        json_attr_topic = self.get_json_attributes_topic()
-        payload = json.dumps(
-            {
-                "in_progress": True,
-                "update_percentage": pos * 100 // size,
-            }
-        )
-        await mqtt_client.publish(json_attr_topic, payload=payload, retain=False)
-
 
 @EntityRegistry.register
 class NMTStateSensor(Entity):
@@ -741,3 +676,16 @@ class Alarm(StateMixin, CommandMixin, Entity):
         "code_disarm_requried": False,
         "code_trigger_required": False,
     }
+
+@EntityRegistry.register
+class UnconfiguredDeviceEntity(CommandMixin, Entity):
+    TYPE_ID = 254
+    TYPE_NAME = "text"
+    PROPS = {
+        "name": "Unconfigured BluePill Device",
+        "icon": "mdi:new-box",
+        "placeholder": "Enter config: e.g. 'Device Name, 8 relays'",
+    }
+
+    def commands(self):
+        yield "command_topic", str, datatypes.UTF8_STRING
