@@ -1,8 +1,9 @@
 [project]
-name = "can2mqtt"
-version = "0.2.3"
+name = "canopen2HAmqtt"
+version = "0.3.0"
 authors = [
-    {name="Mariusz Kryński", email="mrk@sed.pl"}
+    {name="Mariusz Kryński", email="mrk@sed.pl"},
+    {name="Roman Oskolkov", email="oksollkof@gmail.com"}
 ]
 requires-python = ">=3.8"
 
@@ -17,7 +18,7 @@ dependencies = [
 ]
 
 [project.scripts]  # Optional
-can2mqtt = "main:main"
+canopen2HAmqtt = "main:main"
 
 [project.optional-dependencies]
 dev = [
@@ -25,4 +26,4 @@ dev = [
 ]
 
 [tool.setuptools.package-data]
-can2mqtt = ["eds/*.eds"]
+canopen2HAmqtt = ["eds/*.eds"]

@@ -1,0 +1,87 @@
+name: Build Addon
+
+on:
+  push:
+    branches:
+      - main
+    tags:
+      - "*.*.*"
+  workflow_dispatch:
+
+env:
+  ARCHITECTURES: '["amd64", "aarch64", "i386"]'
+  IMAGE_NAME: canopen2hamqtt
+
+permissions:
+  contents: read
+  packages: write
+  id-token: write
+
+jobs:
+  init:
+    name: Initialize build
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.matrix.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Get build matrix
+        id: matrix
+        uses: home-assistant/builder/actions/prepare-multi-arch-matrix@2026.03.2
+        with:
+          architectures: ${{ env.ARCHITECTURES }}
+          image-name: ${{ env.IMAGE_NAME }}
+
+  build:
+    name: Build ${{ matrix.arch }} image
+    needs: init
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.init.outputs.matrix) }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Determine image tags
+        id: tags
+        run: |
+          if [[ "${{ github.ref_name }}" == "main" ]]; then
+            echo "tags=edge" >> $GITHUB_OUTPUT
+          else
+            echo "tags=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Build image
+        id: build
+        uses: home-assistant/builder/actions/build-image@2026.03.2
+        with:
+          arch: ${{ matrix.arch }}
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          image: ${{ matrix.image }}
+          image-tags: ${{ steps.tags.outputs.tags }}
+          push: true
+          version: ${{ github.ref_name }}
+
+  manifest:
+    name: Publish multi-arch manifest
+    needs: [init, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Determine image tags
+        id: tags
+        run: |
+          if [[ "${{ github.ref_name }}" == "main" ]]; then
+            echo "tags=edge" >> $GITHUB_OUTPUT
+          else
+            echo "tags=${{ github.ref_name }},latest" >> $GITHUB_OUTPUT
+          fi
+      - name: Publish multi-arch manifest
+        uses: home-assistant/builder/actions/publish-multi-arch-manifest@2026.03.2
+        with:
+          architectures: ${{ env.ARCHITECTURES }}
+          container-registry-password: ${{ secrets.GITHUB_TOKEN }}
+          image-name: ${{ env.IMAGE_NAME }}
+          image-tags: ${{ steps.tags.outputs.tags }}

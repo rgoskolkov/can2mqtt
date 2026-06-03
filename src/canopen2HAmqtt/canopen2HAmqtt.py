@@ -227,7 +227,7 @@ async def find_free_node_id(can_network: Network) -> int:
 
 async def can_bus_reader(can_network, mqtt_client, mqtt_topic_prefix, devices_config, watchdog, sdo_timeout):
     """Periodically scans the CAN bus, handling node discovery and state."""
-    await publish_can2mqtt_status(mqtt_client, mqtt_topic_prefix, "online")
+    await publish_addon_status(mqtt_client, mqtt_topic_prefix, "online")
 
     # Generic OD for initial communication with unknown/unconfigured nodes
     generic_od = import_od(os.path.join(BASE_DIR, "eds/bluepill.eds"))
@@ -327,7 +327,7 @@ async def mqtt_message_reader(mqtt_client, can_network, mqtt_topic_prefix):
                 for node in can_network.values():
                     if node and node.is_supported:
                         await mqtt_client.publish(node.availability_topic, payload="online", retain=True)
-                await publish_can2mqtt_status(mqtt_client, mqtt_topic_prefix, "online")
+                await publish_addon_status(mqtt_client, mqtt_topic_prefix, "online")
                 continue
 
             entity = CommandMixin.get_entity_by_cmd_topic(topic)
@@ -356,15 +356,15 @@ async def mqtt_message_reader(mqtt_client, can_network, mqtt_topic_prefix):
                     logger.error("Error processing command for %r: %s", entity, e)
 
 
-async def publish_can2mqtt_status(mqtt_client, mqtt_topic_prefix, status):
-    status_topic = f"{mqtt_topic_prefix}/can2mqtt/status"
+async def publish_addon_status(mqtt_client, mqtt_topic_prefix, status):
+    status_topic = f"{mqtt_topic_prefix}/canopen2HAmqtt/status"
     await mqtt_client.publish(status_topic, payload=status, retain=True)
 
 
 async def start(mqtt_server, interface, channel, bitrate, mqtt_topic_prefix, sdo_response_timeout=0.5, watchdog_timeout=60, devices=None, **kwargs):
     main_watchdog = WatchdogTimer(watchdog_timeout)
     mqtt_host, auth = parse_mqtt_server_url(mqtt_server)
-    will = aiomqtt.Will(f"{mqtt_topic_prefix}/can2mqtt/status", b"offline", 1, retain=True)
+    will = aiomqtt.Will(f"{mqtt_topic_prefix}/canopen2HAmqtt/status", b"offline", 1, retain=True)
     
     logger.info("Connecting to MQTT server at %s", mqtt_host)
     async with aiomqtt.Client(mqtt_host, will=will, **auth) as mqtt_client:
@@ -386,7 +386,7 @@ async def start(mqtt_server, interface, channel, bitrate, mqtt_topic_prefix, sdo
             for node in can_network.values():
                 if hasattr(node, 'is_supported') and node.is_supported:
                     await mqtt_client.publish(node.availability_topic, payload="offline", retain=True)
-            await publish_can2mqtt_status(mqtt_client, mqtt_topic_prefix, "offline")
+            await publish_addon_status(mqtt_client, mqtt_topic_prefix, "offline")
             can_network.disconnect()
             logger.info("Shutdown complete.")
     return 0

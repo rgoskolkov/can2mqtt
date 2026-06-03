@@ -4,7 +4,7 @@ import logging
 import sys
 
 import coloredlogs
-import can2mqtt
+import canopen2HAmqtt
 import can
 
 
@@ -15,7 +15,7 @@ def main():
     asyncio.iscouroutine = asyncio.iscoroutine
 
     parser = argparse.ArgumentParser(
-        prog="can2mqtt",
+        prog="canopen2HAmqtt",
         description="CAN to MQTT converter",
     )
     parser.add_argument("-s", "--mqtt-server")
@@ -45,4 +45,4 @@ def main():
     )
     coloredlogs.install(level=args.log_level)
 
-    sys.exit(asyncio.run(can2mqtt.start(**config)))
+    sys.exit(asyncio.run(canopen2HAmqtt.start(**config)))

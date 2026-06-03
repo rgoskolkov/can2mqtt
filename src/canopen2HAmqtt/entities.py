@@ -244,7 +244,7 @@ class Entity:
                     "topic": self.node.availability_topic,
                 },
                 {
-                    "topic": f"{self.mqtt_topic_prefix}/can2mqtt/status",
+                    "topic": f"{self.mqtt_topic_prefix}/canopen2HAmqtt/status",
                 },
             ],
             "availability_mode": "all",

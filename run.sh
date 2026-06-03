@@ -13,4 +13,4 @@ if test "$EXTRA_ARGS" == null; then
 fi
 
 set -x
-can2mqtt -i "$INTERFACE" -s "$SERVER" -c "$CHANNEL" -b "$BITRATE" $TOPIC --sdo-response-timeout $TIMEOUT --firmware-dir $FIRMWARE_DIR $EXTRA_ARGS
+canopen2HAmqtt -i "$INTERFACE" -s "$SERVER" -c "$CHANNEL" -b "$BITRATE" $TOPIC --sdo-response-timeout $TIMEOUT --firmware-dir $FIRMWARE_DIR $EXTRA_ARGS

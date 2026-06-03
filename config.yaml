@@ -1,9 +1,9 @@
-name: "can2mqtt"
-description: "can2mqtt gateway"
-slug: "can2mqtt"
+name: "canopen2HAmqtt"
+description: "canopen2HAmqtt gateway"
+slug: "canopen2hamqtt"
 init: false
 
-version: "0.2.9"
+version: "0.3.0"
 homeassistant: "2025.5.3"
 usb: true
 uart: true
@@ -13,13 +13,11 @@ host_network: true
 privileged:
   - NET_ADMIN
 
-image: mrkits/image-{arch}-can2mqtt
+image: "ghcr.io/rgoskolkov/canopen2hamqtt"
 
 arch:
   - aarch64
   - amd64
-    #- armhf
-    #- armv7
   - i386
 
 map:
