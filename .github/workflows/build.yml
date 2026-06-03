@@ -9,7 +9,7 @@ on:
   workflow_dispatch:
 
 env:
-  ARCHITECTURES: '["amd64", "aarch64", "i386"]'
+  ARCHITECTURES: '["amd64", "aarch64"]'
   IMAGE_NAME: canopen2hamqtt
 
 permissions:
@@ -25,7 +25,7 @@ jobs:
       matrix: ${{ steps.matrix.outputs.matrix }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Get build matrix
         id: matrix
@@ -43,16 +43,18 @@ jobs:
       matrix: ${{ fromJSON(needs.init.outputs.matrix) }}
     steps:
       - name: Checkout code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6.0.3
 
       - name: Determine image tags
         id: tags
+        shell: bash
         run: |
           if [[ "${{ github.ref_name }}" == "main" ]]; then
-            echo "tags=edge" >> $GITHUB_OUTPUT
+            TAGS="edge"
           else
-            echo "tags=${{ github.ref_name }}" >> $GITHUB_OUTPUT
+            TAGS="${{ github.ref_name }}"
           fi
+          echo "tags=${TAGS}" >> "${GITHUB_OUTPUT}"
 
       - name: Build image
         id: build
@@ -72,12 +74,16 @@ jobs:
     steps:
       - name: Determine image tags
         id: tags
+        shell: bash
         run: |
           if [[ "${{ github.ref_name }}" == "main" ]]; then
-            echo "tags=edge" >> $GITHUB_OUTPUT
+            TAGS="edge"
           else
-            echo "tags=${{ github.ref_name }},latest" >> $GITHUB_OUTPUT
+            TAGS="$(printf "%s\n%s" "${{ github.ref_name }}" "latest")"
           fi
+          echo "tags<<EOF" >> $GITHUB_OUTPUT
+          echo "$TAGS" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
       - name: Publish multi-arch manifest
         uses: home-assistant/builder/actions/publish-multi-arch-manifest@2026.03.2
         with:

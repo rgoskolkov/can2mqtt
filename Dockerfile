@@ -1,18 +1,30 @@
-ARG BUILD_FROM
-FROM $BUILD_FROM as builder
+# Use the new Home Assistant base image
+FROM ghcr.io/home-assistant/base:latest
 
-RUN apk add --no-cache py3-pip git g++ make python3-dev
-COPY ./ /app/
+# Set up shell
+SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 
-RUN pip install --break-system-packages --user /app
+# Install build dependencies and tools needed for the addon
+# git is required for canopen-async dependency
+# can-utils is useful for debugging
+RUN apk add --no-cache git python3 py3-pip eudev-dev g++ make can-utils
 
-FROM $BUILD_FROM
-RUN apk add python3
-COPY --from=builder /root/.local /root/.local
-COPY ./run.sh /app/run.sh
+# Set the working directory
+WORKDIR /usr/src/app
 
-# Copy data for add-on
-RUN chmod a+x /app/run.sh
-RUN find /root/.local/
-ENV PATH="/root/.local/bin:$PATH"
-CMD [ "/app/run.sh" ]
+# Copy project files
+COPY pyproject.toml ./
+COPY src/ ./src/
+
+# Install the project and its dependencies
+# This will also create the `canopen2HAmqtt` executable
+RUN pip3 install . --no-cache-dir --break-system-packages
+
+# Copy the run script
+COPY run.sh ./
+
+# Make run.sh executable
+RUN chmod a+x run.sh
+
+# This will be executed by the Home Assistant Supervisor
+CMD [ "/usr/src/app/run.sh" ]

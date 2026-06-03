@@ -17,13 +17,20 @@ dependencies = [
     "pyasyncore",
 ]
 
-[project.scripts]  # Optional
+[project.scripts]
 canopen2HAmqtt = "main:main"
 
 [project.optional-dependencies]
 dev = [
     "black"
 ]
+
+[tool.setuptools]
+py-modules = ["main"]
+package-dir = {"" = "src"}
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.setuptools.package-data]
 canopen2HAmqtt = ["eds/*.eds"]

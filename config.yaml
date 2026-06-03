@@ -3,7 +3,7 @@ description: "canopen2HAmqtt gateway"
 slug: "canopen2hamqtt"
 init: false
 
-version: "0.3.0"
+version: "latest"
 homeassistant: "2025.5.3"
 usb: true
 uart: true
@@ -18,18 +18,17 @@ image: "ghcr.io/rgoskolkov/canopen2hamqtt"
 arch:
   - aarch64
   - amd64
-  - i386
 
 map:
   - addon_config
 
 options:
-  interface: null
-  channel: ''
+  interface: socketcan
+  channel: 'can0'
   bitrate: 125000
-  mqtt_server: mqtt://mqtt:mqtt@core-mosquitto
+  mqtt_server: mqtt://can2mqttuser:can2mqttuser@core-mosquitto
   mqtt_topic_prefix: homeassistant
-  firmware_dir: /config
+  watchdog_timeout: 60
   devices:
     - vendor_id: 0x00000BEE
       product_code: 0x0000F103
@@ -43,7 +42,7 @@ schema:
   mqtt_server: str
   mqtt_topic_prefix: str?
   sdo_response_timeout: float?
-  firmware_dir: str?
+  watchdog_timeout: int?
   extra_args: str?
   devices:
     - vendor_id: int
