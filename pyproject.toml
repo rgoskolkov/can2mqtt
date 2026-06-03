@@ -12,9 +12,6 @@ dependencies = [
     "aiomqtt<2",
     "pyserial",
     "coloredlogs",
-    "pyinotify==0.9.6",
-    "awesomeversion==24.6.0",
-    "pyasyncore",
 ]
 
 [project.scripts]

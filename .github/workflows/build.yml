@@ -3,13 +3,13 @@ name: Build Addon
 on:
   push:
     branches:
-      - main
+      - "**"
     tags:
       - "*.*.*"
   workflow_dispatch:
 
 env:
-  ARCHITECTURES: '["amd64", "aarch64"]'
+  ARCHITECTURES: '["aarch64"]'
   IMAGE_NAME: canopen2hamqtt
 
 permissions:

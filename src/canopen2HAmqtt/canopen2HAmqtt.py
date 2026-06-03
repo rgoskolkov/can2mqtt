@@ -13,7 +13,7 @@ from canopen.sdo.exceptions import SdoAbortedError, SdoCommunicationError
 from canopen.objectdictionary import import_od, datatypes, ODRecord, ODArray, ODVariable
 
 from .utils import parse_mqtt_server_url
-from .entities import EntityRegistry, StateMixin, CommandMixin, Entity, UnconfiguredDeviceEntity
+from .entities import EntityRegistry, StateMixin, CommandMixin, Entity, UnconfiguredDeviceEntity, UnsupportedDeviceEntity
 
 # SDO Abort Codes
 CODE_SUBINDEX_NOT_FOUND = 0x06090011
@@ -67,9 +67,33 @@ def get_heartbeat_cb(mqtt_client, node):
         node.watchdog.reset()
         logger.debug("Heartbeat from %02x: %s", node.id, status)
         node.last_heartbeat_time = time.time()
-        if node.ntm_state_entity:
-            state_topic = node.ntm_state_entity.get_state_topic()
-            asyncio.create_task(mqtt_client.publish(state_topic, payload=str(status), retain=False))
+        # A status of 0 is a boot-up message
+        if status == 0 and node.is_initialized:
+            logger.info(f"Node {node.id} has sent a boot-up message. Checking for firmware changes.")
+            
+            async def re_discover_check():
+                """Asynchronously check identity and re-discover if changed."""
+                try:
+                    identity = await asyncio.gather(
+                        node.sdo["Identity"]["VendorId"].aget_raw(),
+                        node.sdo["Identity"]["ProductCode"].aget_raw(),
+                        node.sdo["SoftwareVersion"].aget_raw()
+                    )
+                    new_vendor_id, new_product_code, new_sw_version = identity
+                    
+                    # Compare with stored info
+                    if (node.device_info.get('vendor_id') != new_vendor_id or
+                        node.device_info.get('product_code') != new_product_code or
+                        node.sw_version != new_sw_version):
+                        logger.info(f"Firmware change detected for node {node.id}. Triggering re-discovery.")
+                        node.is_initialized = False
+                    else:
+                        logger.info(f"Node {node.id} reset, but firmware is unchanged.")
+                except Exception as e:
+                    logger.error(f"Error during re-discovery check for node {node.id}: {e}")
+
+            asyncio.create_task(re_discover_check())
+
     return on_heartbeat
 
 
@@ -105,18 +129,20 @@ async def process_node_entities(mqtt_client, mqtt_topic_prefix: str, node: Remot
     """Reads entity definitions from a device and creates/updates them in Home Assistant."""
     logger.info("Processing entities for node %02x...", node.id)
     try:
+        # Overwrite default values with ones from the device
         node.sw_version = await node.sdo["SoftwareVersion"].aget_raw()
         node.device_name = await node.sdo[0x1008].aget_raw()
+        node.hw_version = await node.sdo[0x1009].aget_raw()
     except (SdoAbortedError, SdoCommunicationError) as e:
-        logger.warning("Node %02x: Could not read basic info (SW Version/Device Name): %s", node.id, e)
-        node.sw_version = node.sw_version or "N/A"
-        node.device_name = node.device_name or f"CANopen Node {node.id}"
+        logger.warning("Node %02x: Could not read one or more basic info properties (SW/HW Version/Device Name). Using defaults. Error: %s", node.id, e)
+        # Defaults are already set during node initialization, so we can just pass.
+        pass
     
     node.is_reconfiguring = False
 
     # Remove existing entities before re-discovery, except persistent ones
     for entity in list(Entity.entities()):
-        if entity.node.id == node.id and not isinstance(entity, (NMTStateSensor, UnconfiguredDeviceEntity)):
+        if entity.node.id == node.id and not isinstance(entity, (UnconfiguredDeviceEntity, UnsupportedDeviceEntity)):
             logger.debug("Removing old entity before re-discovery: %s", entity.unique_id)
             await entity.remove_config(mqtt_client)
             Entity.remove_entity(entity.unique_id)
@@ -140,6 +166,8 @@ async def process_node_entities(mqtt_client, mqtt_topic_prefix: str, node: Remot
             continue
 
         base_index = 0x2000 + entity_index * 16
+        node.object_dictionary.add_object(ODRecord("states", base_index + 1))
+        node.object_dictionary.add_object(ODRecord("cmds", base_index + 2))
         entity.setup_object_dictionary(node, base_index)
         async for key, value in async_try_iter_items(node.sdo[base_index]):
             entity.set_metadata_property(key, value)
@@ -164,6 +192,8 @@ async def process_node_entities(mqtt_client, mqtt_topic_prefix: str, node: Remot
 async def register_new_node(mqtt_client, mqtt_topic_prefix, can_network, node, devices_config):
     """Handles a newly detected or re-initialized node on the bus."""
     try:
+        # Set a default device_name before any potential errors
+        node.device_name = f"CANopen Node {node.id}"
         identity = await asyncio.gather(
             node.sdo["Identity"]["VendorId"].aget_raw(),
             node.sdo["Identity"]["ProductCode"].aget_raw(),
@@ -186,25 +216,19 @@ async def register_new_node(mqtt_client, mqtt_topic_prefix, can_network, node, d
         hb_time = await node.sdo["ProducerHeartbeatTime"].aget_raw()
         node.prod_heartbeat_time = hb_time
         node.watchdog = WatchdogTimer(2 * hb_time / 1000.0 if hb_time else None)
-        if not node.has_nmt_callback:
-            node.nmt.add_hearbeat_callback(get_heartbeat_cb(mqtt_client, node))
+        if not hasattr(node, 'has_nmt_callback') or not node.has_nmt_callback:
+            node.nmt.add_heartbeat_callback(get_heartbeat_cb(mqtt_client, node))
             node.has_nmt_callback = True
     except (SdoAbortedError, SdoCommunicationError):
         logger.warning("Node %02x: Could not read ProducerHeartbeatTime. Availability monitoring may be impaired.", node.id)
 
-    # Create NMT state sensor
-    if not node.ntm_state_entity:
-        nmt_entity = EntityRegistry.create(0, node, 0, mqtt_topic_prefix)
-        nmt_entity.set_property("name", "NMT State")
-        node.ntm_state_entity = nmt_entity
-        await nmt_entity.publish_config(mqtt_client)
-
     # Check if device is configured by reading its name. If not, publish config entity.
     try:
-        device_name = await node.sdo[0x1008].aget_raw()
-        if not device_name.strip():
+        device_name_from_node = await node.sdo[0x1008].aget_raw()
+        if not device_name_from_node.strip():
             raise SdoAbortedError("Device name is empty")
-        logger.info("Node %02x is already configured as '%s'. Processing entities.", node.id, device_name)
+        node.device_name = device_name_from_node # Update device_name with the one from the node
+        logger.info("Node %02x is already configured as '%s'. Processing entities.", node.id, node.device_name)
         await process_node_entities(mqtt_client, mqtt_topic_prefix, node)
     except (SdoAbortedError, SdoCommunicationError):
         logger.info("Node %02x is unconfigured. Publishing configuration entity.", node.id)
@@ -231,21 +255,18 @@ async def can_bus_reader(can_network, mqtt_client, mqtt_topic_prefix, devices_co
 
     # Generic OD for initial communication with unconfigured nodes
     generic_od = import_od(os.path.join(BASE_DIR, "eds/bluepill.eds"))
+    
+    unsupported_nodes = set()
 
     while True:
         watchdog.reset()
-
-        # Give the network some time to process incoming messages from the background scanner
         await asyncio.sleep(1.0)
         
-        # --- Handle unconfigured devices (Node ID 0) first ---
-        # The canopen-async library populates scanner.nodes in the background
         if UNCONFIGURED_NODE_ID in can_network.scanner.nodes and not can_network.get(UNCONFIGURED_NODE_ID):
             logger.info("Unconfigured device (node ID 0) detected.")
             temp_node_0 = can_network.add_node(UNCONFIGURED_NODE_ID, generic_od)
             temp_node_0.sdo.RESPONSE_TIMEOUT = sdo_timeout
             try:
-                # Find a free ID that is not already on the bus
                 all_node_ids = set(can_network.scanner.nodes) | {node.id for node in can_network.values()}
                 free_node_id = 1
                 while free_node_id in all_node_ids:
@@ -262,18 +283,15 @@ async def can_bus_reader(can_network, mqtt_client, mqtt_topic_prefix, devices_co
             finally:
                 if UNCONFIGURED_NODE_ID in can_network:
                     del can_network[UNCONFIGURED_NODE_ID]
-            continue # Restart the loop to handle the newly numbered node
+            continue
 
-        # --- Handle all other known and unknown nodes ---
         for node_id in can_network.scanner.nodes:
-            if node_id == UNCONFIGURED_NODE_ID:
+            if node_id in unsupported_nodes or node_id == UNCONFIGURED_NODE_ID:
                 continue
 
             node = can_network.get(node_id)
             if not node:
-                # New node detected, add it to our network object
                 logger.info("New node %02x detected. Trying to identify...", node_id)
-                # Temporarily add with generic OD to read identity
                 temp_node = can_network.add_node(node_id, generic_od)
                 temp_node.sdo.RESPONSE_TIMEOUT = sdo_timeout
                 try:
@@ -281,37 +299,44 @@ async def can_bus_reader(can_network, mqtt_client, mqtt_topic_prefix, devices_co
                     product_code = await temp_node.sdo[0x1018][2].aget_raw()
                 except (SdoCommunicationError, SdoAbortedError) as e:
                     logger.error("Failed to query identity of new node %02x: %s", node_id, e)
+                    unsupported_nodes.add(node_id)
                     del can_network[node_id]
                     continue
-                finally:
-                    # remove temp node before adding real one
-                    if node_id in can_network:
-                        del can_network[node_id]
-
+                
                 device_info = next((d for d in devices_config if d['vendor_id'] == vendor_id and d['product_code'] == product_code), None)
                 if device_info and 'eds_file' in device_info:
+                    del can_network[node_id]
                     od = import_od(os.path.join(BASE_DIR, "eds", device_info['eds_file']))
                     logger.info("Loading EDS '%s' for node %02x", device_info['eds_file'], node_id)
+                    node = can_network.add_node(node_id, od)
                 else:
-                    logger.warning("No matching device config for node %02x (Vendor: %s, Product: %s), skipping.", node_id, hex(vendor_id), hex(product_code))
-                    continue # Skip unsupported device
+                    logger.warning("No matching device config for node %02x (Vendor: %s, Product: %s). Creating informational entity.", node_id, hex(vendor_id), hex(product_code))
+                    unsupported_entity = EntityRegistry.create(253, temp_node, 0, mqtt_topic_prefix, 0)
+                    unsupported_entity.vendor_id = vendor_id
+                    unsupported_entity.product_code = product_code
+                    await unsupported_entity.publish_config(mqtt_client)
+                    await unsupported_entity.mqtt_initial_publish(mqtt_client)
+                    unsupported_nodes.add(node_id)
+                    del can_network[node_id]
+                    continue
 
-                node = can_network.add_node(node_id, od)
                 node.sdo.RESPONSE_TIMEOUT = sdo_timeout
                 node.is_initialized = False
-                node.is_supported = False # Will be set in register_new_node
+                node.is_supported = False
                 node.last_heartbeat_time = time.time()
                 node.availability = None
                 node.availability_topic = f"{mqtt_topic_prefix}/can_{node_id:03x}/availability"
                 node.prod_heartbeat_time = None
-                node.ntm_state_entity = None
                 node.has_nmt_callback = False
-                node.watchdog = WatchdogTimer(None) # Will be updated from heartbeat time
+                node.watchdog = WatchdogTimer(None)
                 node.is_reconfiguring = False
                 node.device_info = {}
+                node.device_name = f"CANopen Node {node.id}" # Default name
+                node.sw_version = "N/A"
+                node.hw_version = ""
 
             just_registered = False
-            if not node.is_initialized and node.nmt.state == "OPERATIONAL":
+            if not node.is_initialized:
                 try:
                     logger.info("Registering node: %02x", node.id)
                     await register_new_node(mqtt_client, mqtt_topic_prefix, can_network, node, devices_config)
@@ -388,9 +413,10 @@ async def start(mqtt_server, interface, channel, bitrate, mqtt_topic_prefix, sdo
     mqtt_host, auth = parse_mqtt_server_url(mqtt_server)
     will = aiomqtt.Will(f"{mqtt_topic_prefix}/canopen2HAmqtt/status", b"offline", 1, retain=True)
     
+    can_network = canopen.Network()
+    
     logger.info("Connecting to MQTT server at %s", mqtt_host)
     async with aiomqtt.Client(mqtt_host, will=will, **auth) as mqtt_client:
-        can_network = canopen.Network()
         try:
             can_network.connect(loop=asyncio.get_running_loop(), interface=interface, channel=channel, bitrate=bitrate, **kwargs)
             logger.info(f"Connected to CAN bus via {interface}:{channel} at {bitrate} bps")

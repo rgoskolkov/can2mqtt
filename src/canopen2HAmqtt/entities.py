@@ -306,8 +306,8 @@ class EntityRegistry:
         return entity_class
 
     @classmethod
-    def create(cls, type_id, node, entity_index, mqtt_topic_prefix):
-        version = (type_id >> 8) & 0xFF
+    def create(cls, type_id, node, entity_index, mqtt_topic_prefix, version_override=None):
+        version = (type_id >> 8) & 0xFF if version_override is None else version_override
         caps = (type_id >> 16) & 0xFFFF
         type_id = type_id & 0xFF
         logger.info("type_id: %s, version: %s, caps: %s", type_id, version, caps)
@@ -316,21 +316,6 @@ class EntityRegistry:
             node, entity_index, mqtt_topic_prefix, caps
         )
 
-@EntityRegistry.register
-class NMTStateSensor(Entity):
-    TYPE_ID = 0
-    TYPE_NAME = "sensor"
-    STATES = [
-        ("state_topic", str, datatypes.UNSIGNED8),
-    ]
-
-    def get_state_topic(self):
-        return f"{self.mqtt_topic_prefix}/can_state_{self.node.id:03x}_nmt_state"
-
-    def get_mqtt_config(self):
-        config = super().get_mqtt_config()
-        config["state_topic"] = self.get_state_topic()
-        return config
 
 
 def float_to_str(value):
@@ -432,8 +417,24 @@ class Switch(StateMixin, CommandMixin, Entity):
 
 
 @EntityRegistry.register
-class Light(StateMixin, CommandMixin, Entity):
+class SimpleLight(StateMixin, CommandMixin, Entity):
     TYPE_ID = 5
+    VERSION = 0 # This will be the default for type_id 5
+    TYPE_NAME = "light"
+
+    PROPS = {"assumed_state": False}
+
+    def states(self):
+        yield "state_topic", bool2onoff, datatypes.UNSIGNED8
+
+    def commands(self):
+        yield "command_topic", onoff2bool, datatypes.UNSIGNED8
+
+
+@EntityRegistry.register
+class DimmableLight(StateMixin, CommandMixin, Entity):
+    TYPE_ID = 5
+    VERSION = 2 # Changed from 0 to preserve this for more advanced lights
     TYPE_NAME = "light"
 
     PROPS = {"assumed_state": False, "supported_color_modes": ["color_temp"]}
@@ -678,6 +679,61 @@ class Alarm(StateMixin, CommandMixin, Entity):
     }
 
 @EntityRegistry.register
+class UnsupportedDeviceEntity(Entity):
+    """A special entity to represent an unsupported device found on the bus."""
+    TYPE_ID = 253
+    VERSION = 0
+    TYPE_NAME = "sensor"
+    
+    def __init__(self, node, entity_index, mqtt_topic_prefix, caps):
+        # Override unique_id to be based on node_id only
+        super().__init__(node, entity_index, mqtt_topic_prefix, caps)
+        self.unique_id = f"can_unsupported_{self.node.id:03x}"
+        self.vendor_id = 0
+        self.product_code = 0
+
+    def get_mqtt_config(self):
+        # This entity is not tied to a real CANopen device object, so we build a custom device entry
+        cfg = {
+            "unique_id": self.unique_id,
+            "name": f"Unsupported Device with Node {self.node.id}",
+            "icon": "mdi:help-rhombus-outline",
+            "state_topic": f"{self.mqtt_topic_prefix}/{self.TYPE_NAME}/{self.unique_id}/state",
+            "json_attributes_topic": f"{self.mqtt_topic_prefix}/{self.TYPE_NAME}/{self.unique_id}/attributes",
+            "availability": [{"topic": f"{self.mqtt_topic_prefix}/canopen2HAmqtt/status"}],
+            "device": {
+                "identifiers": [f"canopen_unsupported_node_{self.node.id}"],
+                "name": f"Unsupported CANopen Node {self.node.id}",
+                "model": "Unknown CANopen Device",
+                "manufacturer": "Unknown"
+            },
+        }
+        return cfg
+
+    async def mqtt_initial_publish(self, mqtt_client):
+        """Publishes the static state and attributes for this informational sensor."""
+        # Main state now shows the most important info directly
+        state_payload = f"VID: {hex(self.vendor_id)}, PID: {hex(self.product_code)}"
+        await mqtt_client.publish(
+            f"{self.mqtt_topic_prefix}/{self.TYPE_NAME}/{self.unique_id}/state",
+            state_payload,
+            retain=True
+        )
+
+        # Attributes topic still contains all details
+        attributes = {
+            "node_id": self.node.id,
+            "vendor_id": hex(self.vendor_id),
+            "product_code": hex(self.product_code),
+            "comment": "To support this device, add its vendor and product ID to the devices list in the addon configuration."
+        }
+        await mqtt_client.publish(
+            f"{self.mqtt_topic_prefix}/{self.TYPE_NAME}/{self.unique_id}/attributes",
+            json.dumps(attributes),
+            retain=True
+        )
+
+@EntityRegistry.register
 class UnconfiguredDeviceEntity(CommandMixin, Entity):
     TYPE_ID = 254
     TYPE_NAME = "text"
@@ -688,4 +744,5 @@ class UnconfiguredDeviceEntity(CommandMixin, Entity):
     }
 
     def commands(self):
-        yield "command_topic", str, datatypes.UTF8_STRING
+        yield "command_topic", str, datatypes.OCTET_STRING
+
