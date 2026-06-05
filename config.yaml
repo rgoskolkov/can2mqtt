@@ -28,6 +28,7 @@ options:
   mqtt_server: mqtt://can2mqttuser:can2mqttuser@core-mosquitto
   mqtt_topic_prefix: homeassistant
   watchdog_timeout: 60
+  configure_can_interface: true
   devices:
     - vendor_id: 0x00000BEE
       product_code: 0x0000F103
@@ -42,6 +43,7 @@ schema:
   mqtt_topic_prefix: str?
   sdo_response_timeout: float?
   watchdog_timeout: int?
+  configure_can_interface: bool?
   extra_args: str?
   devices:
     - vendor_id: int

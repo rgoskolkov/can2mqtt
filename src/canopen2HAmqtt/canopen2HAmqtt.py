@@ -13,7 +13,7 @@ from canopen.sdo.exceptions import SdoAbortedError, SdoCommunicationError
 from canopen.objectdictionary import import_od, datatypes, ODRecord, ODArray, ODVariable
 
 from .utils import parse_mqtt_server_url
-from .entities import EntityRegistry, StateMixin, CommandMixin, Entity, UnconfiguredDeviceEntity, UnsupportedDeviceEntity
+from .entities import Entity, EntityRegistry, StateMixin, CommandMixin, UnconfiguredDeviceEntity, UnsupportedDeviceEntity, SimpleLight
 
 # SDO Abort Codes
 CODE_SUBINDEX_NOT_FOUND = 0x06090011
@@ -28,6 +28,96 @@ class QuitException(Exception):
     def __init__(self, descr, exit_code=1):
         super().__init__(descr)
         self.exit_code = exit_code
+
+
+async def ensure_can_interface_up(device: str, bitrate: str):
+    """
+    Uses the 'ip' command to configure and bring up the CAN interface.
+    This function attempts to detect if it's in a full iproute2 environment or a
+    limited BusyBox environment and adapts its strategy accordingly.
+    """
+    logging.info(f"Attempting to configure CAN interface '{device}'...")
+
+    # First, try to use `ip -details` which is only available in iproute2
+    is_iproute2 = False
+    is_can_device = False
+    try:
+        proc_check = await asyncio.create_subprocess_shell(
+            f"ip -details link show {device}",
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE
+        )
+        stdout_bytes, stderr_bytes = await proc_check.communicate()
+        stderr = stderr_bytes.decode().strip()
+
+        if proc_check.returncode == 0:
+            is_iproute2 = True
+            is_can_device = "link/can" in stdout_bytes.decode().strip()
+            logging.info(f"Detected iproute2 environment. Interface '{device}' is a can device: {is_can_device}")
+        else:
+            # Check for errors that indicate a BusyBox environment
+            if "invalid option" in stderr or "Usage: ip" in stderr:
+                logging.warning("`ip -details` not supported, falling back to BusyBox-compatible mode.")
+            else: # Another error occurred, might not be a can device yet
+                logging.info(f"'{device}' may not exist yet, proceeding with creation.")
+
+    except FileNotFoundError:
+        logging.error("The 'ip' command is not found. This is required to configure the CAN interface.")
+        raise
+
+    # --- Configuration sequence ---
+    try:
+        # 1. Bring interface down (best-effort to allow bitrate changes).
+        cmd_down = f"ip link set {device} down"
+        logging.debug(f"Executing: {cmd_down}")
+        proc_down = await asyncio.create_subprocess_shell(cmd_down, stderr=asyncio.subprocess.PIPE)
+        _, stderr_down_bytes = await proc_down.communicate()
+        if proc_down.returncode != 0:
+            error_msg = stderr_down_bytes.decode().strip()
+            if "No such device" not in error_msg:
+                logging.warning(f"Could not bring interface '{device}' down (it may be down already): {error_msg}")
+
+        # 2. Set CAN type and bitrate.
+        # If we know it's already a can device, don't set the type again.
+        if is_iproute2 and is_can_device:
+            cmd_set = f"ip link set {device} bitrate {bitrate}"
+            logging.info(f"Setting bitrate for existing CAN interface '{device}'...")
+        else:
+            cmd_set = f"ip link set {device} type can bitrate {bitrate}"
+            logging.info(f"Setting CAN type and bitrate for '{device}'...")
+
+        proc_set = await asyncio.create_subprocess_shell(cmd_set, stderr=asyncio.subprocess.PIPE)
+        _, stderr_set_bytes = await proc_set.communicate()
+        stderr_set = stderr_set_bytes.decode().strip()
+
+        if proc_set.returncode != 0:
+            # Handle common "already configured" errors gracefully
+            if "RTNETLINK answers: File exists" in stderr_set or "either \"dev\" is duplicate" in stderr_set:
+                logging.warning(f"Interface '{device}' likely already configured. Ignoring error: {stderr_set}")
+            elif "Device or resource busy" in stderr_set:
+                 logging.warning(f"Could not set type/bitrate for '{device}' (device is busy). Ignoring error: {stderr_set}")
+            else:
+                # Any other error is a real problem.
+                raise RuntimeError(f"Failed to configure CAN interface '{device}': {stderr_set}")
+
+        # 3. Bring interface up.
+        cmd_up = f"ip link set {device} up"
+        logging.debug(f"Executing: {cmd_up}")
+        proc_up = await asyncio.create_subprocess_shell(cmd_up, stderr=asyncio.subprocess.PIPE)
+        _, stderr_up_bytes = await proc_up.communicate()
+        if proc_up.returncode != 0:
+            error_msg = stderr_up_bytes.decode().strip()
+            # If it's already up, "File exists" or "Device or resource busy" can be returned.
+            if "Device or resource busy" in error_msg or "RTNETLINK answers: File exists" in error_msg:
+                 logging.warning(f"Could not bring up CAN interface '{device}' (may be already up). Ignoring error: {error_msg}")
+            else:
+                raise RuntimeError(f"Failed to bring up CAN interface '{device}': {error_msg}")
+
+        logging.info(f"CAN interface '{device}' configuration sequence completed successfully.")
+
+    except Exception as e:
+        logging.error(f"An unexpected error occurred during CAN interface setup: {e}")
+        raise
 
 
 async def async_try_iter_items(obj):
@@ -101,18 +191,42 @@ def get_tpdo_cb(mqtt_client):
     """Callback for CANopen TPDO messages."""
     async def on_tpdo(map):
         node_id = map.pdo_node.node.id
-        for v in map.map:
-            key = (v.index << 16) | (v.subindex << 8)
-            entity = StateMixin.get_entity_by_node_state_key(node_id, key)
-            if entity:
+        for var in map: # var is an ODVariable that was mapped
+            # Check if the updated variable is the relay state mask from our new SDO
+            if var.index == 0x2100 and var.subindex == 0:
                 try:
-                    state_topic, value = entity.get_mqtt_state(key, await v.aget_raw())
-                    await mqtt_client.publish(state_topic, payload=value, retain=False)
-                    logger.debug("MQTT TPDO publish topic: %s value: %s", state_topic, value)
-                except ValueError as e:
-                    logger.error("Error publishing TPDO state for node %d: %s", node_id, e)
+                    state_mask = await var.aget_raw()
+                    logger.debug(f"Received TPDO with relay state mask for node {node_id}: {state_mask:08b}")
+                    
+                    # Update all 8 light entities based on the new mask
+                    for i in range(8):
+                        # The entity_index in the addon is 1-based, relay index is 0-based
+                        entity_unique_id = f"can_{node_id:03x}_{(i + 1):02x}"
+                        entity = Entity.get_entity_by_unique_id(entity_unique_id)
+                        
+                        if entity and isinstance(entity, SimpleLight):
+                            individual_state = (state_mask >> i) & 1
+                            if entity.state_map:
+                                state_key = entity.state_map[0] # SimpleLight has only one state
+                                topic, mqtt_value = entity.get_mqtt_state(state_key, individual_state)
+                                await mqtt_client.publish(topic, payload=mqtt_value, retain=False)
+                                logger.debug(f"Updated {entity.unique_id} to {mqtt_value} from TPDO mask.")
+                except Exception as e:
+                    logger.error(f"Error processing TPDO bitmask for node {node_id}: {e}")
+                return # We handled the bitmask, so we can stop processing this PDO map
+            
+            # Fallback for any other potential 1-to-1 PDO mappings
             else:
-                logger.warning("No entity found for TPDO from node: %d, key: %08x", node_id, key)
+                try:
+                    key = (var.index << 16) | (var.subindex << 8)
+                    entity = StateMixin.get_entity_by_node_state_key(node_id, key)
+                    if entity:
+                        state_topic, value = entity.get_mqtt_state(key, await var.aget_raw())
+                        await mqtt_client.publish(state_topic, payload=value, retain=False)
+                        logger.debug("MQTT TPDO (fallback) publish topic: %s value: %s", state_topic, value)
+                except ValueError as e:
+                    logger.error("Error publishing fallback TPDO state for node %d: %s", node_id, e)
+
     return on_tpdo
 
 
@@ -135,19 +249,18 @@ async def process_node_entities(mqtt_client, mqtt_topic_prefix: str, node: Remot
         node.hw_version = await node.sdo[0x1009].aget_raw()
     except (SdoAbortedError, SdoCommunicationError) as e:
         logger.warning("Node %02x: Could not read one or more basic info properties (SW/HW Version/Device Name). Using defaults. Error: %s", node.id, e)
-        # Defaults are already set during node initialization, so we can just pass.
-        pass
+        pass # Defaults are already set during node initialization
     
     node.is_reconfiguring = False
 
-    # Remove existing entities before re-discovery, except persistent ones
+    # Remove existing entities before re-discovery
     for entity in list(Entity.entities()):
         if entity.node.id == node.id and not isinstance(entity, (UnconfiguredDeviceEntity, UnsupportedDeviceEntity)):
             logger.debug("Removing old entity before re-discovery: %s", entity.unique_id)
             await entity.remove_config(mqtt_client)
             Entity.remove_entity(entity.unique_id)
 
-    # Entity types are at index 0x2001 (UNSIGNED32)
+    # Discover and publish config for all entities from SDO 0x2001
     entity_types_index = 0x2001
     if entity_types_index not in node.object_dictionary:
         arr = ODArray("EntityTypes", entity_types_index)
@@ -155,11 +268,9 @@ async def process_node_entities(mqtt_client, mqtt_topic_prefix: str, node: Remot
         arr.add_member(od_variable(datatypes.UNSIGNED32, "item1", entity_types_index, 1))
         node.object_dictionary.add_object(arr)
 
-    node_entity_ids = set()
     async for entity_index, entity_type in async_try_iter_items(node.sdo[entity_types_index]):
         try:
             entity = EntityRegistry.create(entity_type, node, entity_index, mqtt_topic_prefix)
-            node_entity_ids.add(entity.unique_id)
             logger.info("  Discovered entity: %r", entity)
         except KeyError:
             logger.warning("  Unknown entity type %d at index %d on node %02x", entity_type, entity_index, node.id)
@@ -172,12 +283,25 @@ async def process_node_entities(mqtt_client, mqtt_topic_prefix: str, node: Remot
         async for key, value in async_try_iter_items(node.sdo[base_index]):
             entity.set_metadata_property(key, value)
         await entity.publish_config(mqtt_client)
+    
+    # Read initial state from the master mask (0x2100) and publish to all entities
+    try:
+        state_mask = await node.sdo[0x2100].aget_raw()
+        logger.info(f"Read initial relay state mask for node {node.id}: {state_mask:08b}")
 
-    # Publish initial state for newly discovered entities
-    for entity_id in node_entity_ids:
-        entity = Entity._entities.get(entity_id)
-        if entity:
-            await entity.mqtt_initial_publish(mqtt_client)
+        for i in range(8):
+            entity_unique_id = f"can_{node.id:03x}_{(i + 1):02x}"
+            entity = Entity.get_entity_by_unique_id(entity_unique_id)
+            
+            if entity and isinstance(entity, SimpleLight) and entity.state_map:
+                individual_state = (state_mask >> i) & 1
+                state_key = entity.state_map[0]
+                topic, mqtt_value = entity.get_mqtt_state(state_key, individual_state)
+                await mqtt_client.publish(topic, payload=mqtt_value, retain=False)
+                logger.debug(f"Published initial state for {entity.unique_id}: {mqtt_value}")
+
+    except Exception as e:
+        logger.error(f"Could not read initial state mask from 0x2100 for node {node.id}: {e}")
 
     # Re-read and apply TPDO configuration
     logger.debug("Re-reading TPDO configuration for node %02x", node.id)
@@ -192,7 +316,6 @@ async def process_node_entities(mqtt_client, mqtt_topic_prefix: str, node: Remot
 async def register_new_node(mqtt_client, mqtt_topic_prefix, can_network, node, devices_config):
     """Handles a newly detected or re-initialized node on the bus."""
     try:
-        # Set a default device_name before any potential errors
         node.device_name = f"CANopen Node {node.id}"
         identity = await asyncio.gather(
             node.sdo["Identity"]["VendorId"].aget_raw(),
@@ -222,12 +345,11 @@ async def register_new_node(mqtt_client, mqtt_topic_prefix, can_network, node, d
     except (SdoAbortedError, SdoCommunicationError):
         logger.warning("Node %02x: Could not read ProducerHeartbeatTime. Availability monitoring may be impaired.", node.id)
 
-    # Check if device is configured by reading its name. If not, publish config entity.
     try:
         device_name_from_node = await node.sdo[0x1008].aget_raw()
         if not device_name_from_node.strip():
             raise SdoAbortedError("Device name is empty")
-        node.device_name = device_name_from_node # Update device_name with the one from the node
+        node.device_name = device_name_from_node
         logger.info("Node %02x is already configured as '%s'. Processing entities.", node.id, node.device_name)
         await process_node_entities(mqtt_client, mqtt_topic_prefix, node)
     except (SdoAbortedError, SdoCommunicationError):
@@ -253,15 +375,14 @@ async def can_bus_reader(can_network, mqtt_client, mqtt_topic_prefix, devices_co
     """Periodically checks for new and existing nodes on the bus."""
     await publish_addon_status(mqtt_client, mqtt_topic_prefix, "online")
 
-    # Generic OD for initial communication with unconfigured nodes
     generic_od = import_od(os.path.join(BASE_DIR, "eds/bluepill.eds"))
-    
     unsupported_nodes = set()
 
     while True:
         watchdog.reset()
         await asyncio.sleep(1.0)
         
+        # --- Handle Node 0 (unconfigured) ---
         if UNCONFIGURED_NODE_ID in can_network.scanner.nodes and not can_network.get(UNCONFIGURED_NODE_ID):
             logger.info("Unconfigured device (node ID 0) detected.")
             temp_node_0 = can_network.add_node(UNCONFIGURED_NODE_ID, generic_od)
@@ -285,12 +406,14 @@ async def can_bus_reader(can_network, mqtt_client, mqtt_topic_prefix, devices_co
                     del can_network[UNCONFIGURED_NODE_ID]
             continue
 
-        for node_id in can_network.scanner.nodes:
+        # --- Handle known and new nodes ---
+        nodes_to_process = set(can_network.scanner.nodes)
+        for node_id in nodes_to_process:
             if node_id in unsupported_nodes or node_id == UNCONFIGURED_NODE_ID:
                 continue
 
             node = can_network.get(node_id)
-            if not node:
+            if not node: # New node detected
                 logger.info("New node %02x detected. Trying to identify...", node_id)
                 temp_node = can_network.add_node(node_id, generic_od)
                 temp_node.sdo.RESPONSE_TIMEOUT = sdo_timeout
@@ -298,7 +421,18 @@ async def can_bus_reader(can_network, mqtt_client, mqtt_topic_prefix, devices_co
                     vendor_id = await temp_node.sdo[0x1018][1].aget_raw()
                     product_code = await temp_node.sdo[0x1018][2].aget_raw()
                 except (SdoCommunicationError, SdoAbortedError) as e:
-                    logger.error("Failed to query identity of new node %02x: %s", node_id, e)
+                    # Smart filter for bogus nodes from non-standard PDOs
+                    is_likely_bogus_pdo = False
+                    for known_node in can_network.values():
+                        if getattr(known_node, 'is_supported', False):
+                            # Heuristic: a real node won't be in the TPDO1-4 COB-ID range
+                            if known_node.id < node_id < known_node.id + 16:
+                                logger.warning(f"Ignoring discovery of node {node_id}, as it is likely a non-standard PDO from supported node {known_node.id}.")
+                                is_likely_bogus_pdo = True
+                                break
+                    if not is_likely_bogus_pdo:
+                         logger.error("Failed to query identity of new node %02x: %s", node_id, e)
+                    
                     unsupported_nodes.add(node_id)
                     del can_network[node_id]
                     continue
@@ -309,6 +443,14 @@ async def can_bus_reader(can_network, mqtt_client, mqtt_topic_prefix, devices_co
                     od = import_od(os.path.join(BASE_DIR, "eds", device_info['eds_file']))
                     logger.info("Loading EDS '%s' for node %02x", device_info['eds_file'], node_id)
                     node = can_network.add_node(node_id, od)
+
+                    # Ensure the RelayStateMask object (0x2100) exists, for robustness
+                    if 0x2100 not in node.object_dictionary:
+                        logging.info("Object 0x2100 (RelayStateMask) not found in EDS, adding it programmatically.")
+                        relay_state_mask = ODVariable("RelayStateMask", 0x2100, 0)
+                        relay_state_mask.data_type = datatypes.UNSIGNED8
+                        relay_state_mask.access_type = 'ro'
+                        node.object_dictionary.add_object(relay_state_mask)
                 else:
                     logger.warning("No matching device config for node %02x (Vendor: %s, Product: %s). Creating informational entity.", node_id, hex(vendor_id), hex(product_code))
                     unsupported_entity = EntityRegistry.create(253, temp_node, 0, mqtt_topic_prefix, 0)
@@ -408,7 +550,7 @@ async def publish_addon_status(mqtt_client, mqtt_topic_prefix, status):
     await mqtt_client.publish(status_topic, payload=status, retain=True)
 
 
-async def start(mqtt_server, interface, channel, bitrate, mqtt_topic_prefix, sdo_response_timeout=0.5, watchdog_timeout=60, devices=None, **kwargs):
+async def start(mqtt_server, interface, channel, bitrate, mqtt_topic_prefix, sdo_response_timeout=0.5, watchdog_timeout=60, devices=None, configure_can_interface=False, **kwargs):
     main_watchdog = WatchdogTimer(watchdog_timeout)
     mqtt_host, auth = parse_mqtt_server_url(mqtt_server)
     will = aiomqtt.Will(f"{mqtt_topic_prefix}/canopen2HAmqtt/status", b"offline", 1, retain=True)
@@ -418,6 +560,10 @@ async def start(mqtt_server, interface, channel, bitrate, mqtt_topic_prefix, sdo
     logger.info("Connecting to MQTT server at %s", mqtt_host)
     async with aiomqtt.Client(mqtt_host, will=will, **auth) as mqtt_client:
         try:
+            if interface == 'socketcan' and configure_can_interface:
+                # Configure SocketCAN interface using its device name (e.g., can0) from 'channel'
+                await ensure_can_interface_up(channel, str(bitrate))
+
             can_network.connect(loop=asyncio.get_running_loop(), interface=interface, channel=channel, bitrate=bitrate, **kwargs)
             logger.info(f"Connected to CAN bus via {interface}:{channel} at {bitrate} bps")
             await asyncio.gather(
@@ -428,7 +574,7 @@ async def start(mqtt_server, interface, channel, bitrate, mqtt_topic_prefix, sdo
             logger.warning("Application quitting: %s", e)
             return e.exit_code
         except Exception as e:
-            logger.exception("An unhandled exception occurred in main loop: %s", e)
+            logger.exception("Failed to initialize and start the addon: %s", e)
         finally:
             logger.info("Disconnecting and publishing offline status...")
             for node in can_network.values():

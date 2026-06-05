@@ -114,14 +114,6 @@ class StateMixin:
             state_map.append((index << 16) | (sub << 8))
         self.setup_state_topics(state_map)
 
-    async def mqtt_initial_publish(self, mqtt_client):
-        for state_key in self.state_map:
-            value = await self.node.sdo[state_key >> 16][
-                (state_key >> 8) & 0xFF
-            ].aget_raw()
-            topic, mqtt_value = self.get_mqtt_state(state_key, value)
-            await mqtt_client.publish(topic, mqtt_value, retain=False)
-
 
 class CommandMixin:
     _mqtt_cmd_topic2entity = dict()
@@ -203,6 +195,10 @@ class Entity:
         self.unique_id = f"can_{self.node.id:03x}_{self.entity_index:02x}"
         self.props = {}
         self._entities[self.unique_id] = self
+
+    @classmethod
+    def get_entity_by_unique_id(cls, unique_id):
+        return cls._entities.get(unique_id)
 
     @classmethod
     def entities(cls):
@@ -745,4 +741,3 @@ class UnconfiguredDeviceEntity(CommandMixin, Entity):
 
     def commands(self):
         yield "command_topic", str, datatypes.OCTET_STRING
-

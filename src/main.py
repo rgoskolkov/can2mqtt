@@ -30,6 +30,11 @@ def main():
     parser.add_argument("-d", "--sdo-response-timeout", type=float)
     parser.add_argument("-r", "--sdo-max-retries", type=int)
     parser.add_argument("-w", "--watchdog-timeout", type=int)
+    parser.add_argument(
+        "--configure-can-interface",
+        action="store_true",
+        help="Attempt to configure the CAN interface using 'ip link' commands (for SocketCAN on Linux).",
+    )
     args = parser.parse_args()
 
     config_overrides = {
