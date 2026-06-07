@@ -7,7 +7,7 @@ SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 # Install build dependencies and tools needed for the addon
 # git is required for canopen-async dependency
 # can-utils is useful for debugging
-RUN apk add --no-cache git python3 py3-pip eudev-dev g++ make can-utils
+RUN apk add --no-cache git python3 py3-pip eudev-dev g++ make can-utils iproute2
 
 # Set the working directory
 WORKDIR /usr/src/app

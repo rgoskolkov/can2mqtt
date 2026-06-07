@@ -8,7 +8,7 @@ authors = [
 requires-python = ">=3.8"
 
 dependencies = [
-    "canopen@git+https://github.com/mrk-its/canopen-asyncio#egg=feature-asyncio",
+    "python-can",
     "aiomqtt<2",
     "pyserial",
     "coloredlogs",
@@ -28,6 +28,3 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-canopen2HAmqtt = ["eds/*.eds"]

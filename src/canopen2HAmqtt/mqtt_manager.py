@@ -1,98 +1,107 @@
 import logging
+import typing
 import aiomqtt
-from .app import CanOpen2HAmqtt
 
-from .entities import CommandMixin, Entity, UnconfiguredDeviceEntity
-from .utils import parse_mqtt_server_url
+from typing import Dict, Tuple
+
+from .utils import parse_mqtt_server_url, WatchdogTimer
+from .config import AppConfig
+import canopen2HAmqtt.entities as entities
+
+if typing.TYPE_CHECKING:
+    from .app import CanOpen2HAmqtt
+    from canopen2HAmqtt.entities import Entity
 
 logger = logging.getLogger(__name__)
 
 class MqttManager:
-    app: CanOpen2HAmqtt
-    def __init__(self, app):
+    app: 'CanOpen2HAmqtt'
+    
+    def __init__(self, app: 'CanOpen2HAmqtt', config: AppConfig, watchdog: WatchdogTimer):
         self.app = app
-        self.client = None
+        self.config = config
+        self.watchdog = watchdog
+        self.client: typing.Optional[aiomqtt.Client] = None
+        self._command_entities: Dict[str, Tuple['Entity', int]] = {} # Maps command_topic to (entity, command_index)
 
     async def start(self):
-        """
-        Connects to the MQTT broker and starts the listener.
-        This is the single entry point for all MQTT-related operations.
-        """
-        mqtt_host, auth = parse_mqtt_server_url(self.app.mqtt_server)
-        will = aiomqtt.Will(f"{self.app.mqtt_topic_prefix}/canopen2HAmqtt/status", b"offline", 1, retain=True)
+        mqtt_host, auth = parse_mqtt_server_url(self.config.mqtt_server)
+        will = aiomqtt.Will(f"{self.config.mqtt_topic_prefix}/canopen2HAmqtt/status", b"offline", 1, retain=True)
 
         logger.info("Connecting to MQTT server at %s", mqtt_host)
         async with aiomqtt.Client(mqtt_host, will=will, **auth) as client:
             self.client = client
-
             await self.publish_addon_status("online")
             
             async with self.client.messages() as messages:
-                await self.client.subscribe(f"{self.app.mqtt_topic_prefix}/#")
+                await self.client.subscribe(f"{self.config.mqtt_topic_prefix}/#")
                 async for message in messages:
                     await self.handle_message(message)
 
-    async def publish(self, topic, payload, retain=False):
+    async def publish(self, topic: str, payload: bytes | str, retain: bool = False):
         if not self.client:
-            logger.warning("MQTT client not available, cannot publish message.")
+            logger.warning("MQTT client not available, cannot publish message to %s.", topic)
             return
-        await self.client.publish(topic, payload, retain=retain)
+        if isinstance(payload, str):
+            payload = payload.encode('utf-8')
+        try:
+            await self.client.publish(topic, payload, retain=retain)
+        except Exception as e:
+            logger.error("Error publishing to MQTT topic %s: %s", topic, e)
 
-    async def handle_message(self, message):
-        if self.app.main_watchdog:
-            self.app.main_watchdog.reset()
+    def register_command_entity(self, topic: str, entity: 'Entity', command_index: int):
+        """Registers an entity to receive commands on a specific MQTT topic."""
+        self._command_entities[topic] = (entity, command_index)
+        logger.debug("Registered entity %s for command topic %s", entity.unique_id, topic)
 
+    async def handle_message(self, message: aiomqtt.Message):
+        if self.watchdog:
+            self.watchdog.reset()
+
+        #topic = message.topic.value.decode('utf-8')
         topic = message.topic.value
         logger.debug("Received MQTT message on topic '%s'", topic)
 
-        if topic == f"{self.app.mqtt_topic_prefix}/status" and message.payload == b"online":
+        # Handle Home Assistant status request (e.g., after HA restart)
+        if topic == f"{self.config.mqtt_topic_prefix}/status" and message.payload == b"online":
             await self.handle_status_request()
             return
 
-        entity = CommandMixin.get_entity_by_cmd_topic(topic)
-        if not entity:
+        # Route commands to registered entities
+        if topic in self._command_entities:
+            entity, command_index = self._command_entities[topic]
+            try:
+                await entity.on_mqtt_command(command_index, message.payload)
+            except Exception as e:
+                logger.error("Error processing MQTT command for entity %s on topic %s: %s", entity.unique_id, topic, e)
             return
-
-        if isinstance(entity, UnconfiguredDeviceEntity):
-            await self.handle_unconfigured_device_command(entity, message)
-        else:
-            await self.handle_entity_command(entity, topic, message)
 
     async def handle_status_request(self):
         """Handles a status request from Home Assistant to republish all configs."""
         logger.info("HA requested status update. Re-publishing all configs and states.")
-        for entity in Entity.entities():
-            await entity.publish_config(self)
-            await entity.mqtt_initial_publish(self)
-        for node in self.app.can_manager.get_nodes():
-            if getattr(node, 'is_supported', False):
-                await self.publish(node.availability_topic, payload="online", retain=True)
+        for node_id, device in self.app.can_manager.devices.items():
+            if device.is_supported:
+                # Re-publish discovery configs for all entities on this device
+                for entity in device.entities:
+                    await entity.publish_config()
+                    await entity.mqtt_initial_publish()
+                # Ensure device availability is "online"
+                await device.publish_availability("online")
+            elif node_id == UNCONFIGURED_NODE_ID and device.is_initialized:
+                 # Re-publish config for unconfigured device entity
+                 for entity in device.entities:
+                    if isinstance(entity, entities.UnconfiguredDeviceEntity):
+                        await entity.publish_config()
+            else:
+                 # Re-publish config for unsupported device entity
+                 for entity in device.entities:
+                    if isinstance(entity, entities.UnsupportedDeviceEntity):
+                        await entity.publish_config()
+                        await entity.mqtt_initial_publish()
+        
         await self.publish_addon_status("online")
 
-    async def handle_unconfigured_device_command(self, entity, message):
-        """Handles the command for an unconfigured device to set its name."""
-        try:
-            device_name = message.payload.decode('utf-8').strip()
-            if not device_name: return
-            logger.info("Applying configuration to node %02x: set name to '%s'", entity.node.id, device_name)
-            await entity.node.sdo[0x1008].aset_raw(device_name.encode('utf-8'))
-            await self.app.device_manager.process_node_entities(entity.node)
-            await entity.remove_config(self)
-            Entity.remove_entity(entity.unique_id)
-        except Exception as e:
-            logger.error("Failed to apply configuration for node %02x: %s", entity.node.id, e)
-
-    async def handle_entity_command(self, entity, topic, message):
-        """Handles a standard command for a configured entity."""
-        try:
-            cmd_key, value = entity.get_can_cmd(topic, message.payload)
-            var = entity.node.sdo[cmd_key >> 16][(cmd_key >> 8) & 0xFF]
-            await var.aset_raw(value)
-            logger.debug("Sent command to %r: key=%08x, value=%s", entity, cmd_key, value)
-        except Exception as e:
-            logger.error("Error processing command for %r: %s", entity, e)
-
-    async def publish_addon_status(self, status):
+    async def publish_addon_status(self, status: str):
         """Publishes the addon's own status to MQTT."""
-        status_topic = f"{self.app.mqtt_topic_prefix}/canopen2HAmqtt/status"
+        status_topic = f"{self.config.mqtt_topic_prefix}/canopen2HAmqtt/status"
         await self.publish(status_topic, payload=status, retain=True)

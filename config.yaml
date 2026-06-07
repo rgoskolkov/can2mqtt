@@ -13,7 +13,7 @@ host_network: true
 privileged:
   - NET_ADMIN
 
-image: "ghcr.io/rgoskolkov/canopen2hamqtt"
+#image: "ghcr.io/rgoskolkov/canopen2hamqtt"
 
 arch:
   - aarch64
@@ -34,7 +34,6 @@ options:
       product_code: 0x0000F103
       eds_file: "bluepill.eds"
       model_name: "blue-pill-relay-can"
-      type: "bluepill_relay"
 
 schema:
   interface: str
