@@ -3,9 +3,10 @@ from collections import defaultdict
 from functools import cached_property
 import logging
 import json
-import math
 from canopen.objectdictionary import ODVariable, ODRecord
 from canopen.node import RemoteNode
+
+from .mqtt_manager import MqttManager
 
 
 class OctetString(ODVariable):
@@ -25,52 +26,21 @@ def onoff2bool(value):
     return value == b"ON"
 
 
-def scale_to_wire(
-    value: float | str, min_val: float, max_val: float, max_int: int
-) -> int:
-    value = float(value)
-    if math.isnan(value):
-        return max_int
-    result = round((max_int - 1) * (value - min_val) / (max_val - min_val))
-    return max(0, min(max_int - 1, int(result)))
-
-
-def scale_from_wire(value: int, min_val: float, max_val: float, max_int: int) -> float:
-    if value == max_int:
-        return math.nan
-    return value * (max_val - min_val) / (max_int - 1) + min_val
-
-
-def percentage_to_wire(value: float | str):
-    return scale_to_wire(value, 0.0, 100.0, 255)
-
-
-def percentage_from_wire(value: int):
-    return scale_from_wire(value, 0.0, 100.0, 255)
-
-
-def color_temp_to_wire(value: float | str) -> int:
-    value = float(value)
-    return scale_to_wire(value, 100.0, 1000.0, 255)
-
-
-def color_temp_from_wire(value: int) -> float:
-    # round to int, floats are not expected on mqtt state topic
-    return int(scale_from_wire(value, 100.0, 1000.0, 255))
-
-
-def brightness_to_wire(brightness: float | str):
-    return scale_to_wire(brightness, 0, 254, 255)
-
-
-def brightness_from_wire(value):
-    return scale_from_wire(value, 0, 254, 255)
-
-
 class StateMixin:
+    """
+    A mixin for entities that report state from the CANopen device to Home Assistant.
+    It manages the mapping between CANopen object dictionary variables and MQTT state topics.
+    """
     _node_state_key_2_entity = defaultdict(dict)
 
     def states(self):
+        """
+        Defines the state properties of this entity.
+        Each yielded tuple defines:
+        1. The key in the MQTT discovery config (e.g., "state_topic").
+        2. A function to format the value for MQTT (e.g., bool2onoff).
+        3. The CANopen data type (e.g., datatypes.UNSIGNED8).
+        """
         yield "state_topic", str, datatypes.UNSIGNED8
 
     @cached_property
@@ -81,15 +51,25 @@ class StateMixin:
 
     @classmethod
     def get_entity_by_node_state_key(cls, node_id, state_key):
+        """
+        Finds which entity is responsible for a given state object on a node.
+        Called by the CanManager's TPDO callback.
+        - `state_key`: A unique integer representing a CANopen object (e.g., 0x21010100 for index 2101, subindex 01).
+        """
         return cls._node_state_key_2_entity[node_id].get(state_key)
 
     def setup_state_topics(self, state_map):
+        """
+        Registers this entity instance to handle updates for specific state objects from the device.
+        - `state_map`: A list of integer keys for the state objects this entity listens to.
+        """
         self.state_map = state_map
         logger.debug("setup state topics for %s, %s", self, state_map)
         for state_key in self.state_map:
             self._node_state_key_2_entity[self.node.id][state_key] = self
 
     def get_mqtt_config(self):
+        """Adds the state topics to the Home Assistant discovery payload."""
         config = super(StateMixin, self).get_mqtt_config()
         assert len(self.STATES) == len(self.state_map)
         for (topic, *_), state_key in zip(self.STATES, self.state_map):
@@ -97,13 +77,24 @@ class StateMixin:
         return config
 
     def get_mqtt_state_topic(self, state_key):
+        """Generates the unique MQTT topic for a given state object."""
         return f"{self.mqtt_topic_prefix}/can_state_{self.node.id:03x}_{state_key:08x}"
 
     def get_mqtt_state(self, state_key, value):
+        """
+        Formats a raw value from the CAN bus into the correct format for MQTT.
+        - `state_key`: The CANopen object key that changed.
+        - `value`: The raw value from the device.
+        - Returns: A tuple of (topic, formatted_value).
+        """
         index = self.state_map.index(state_key)
         return self.get_mqtt_state_topic(state_key), self.STATES[index][1](value)
 
     def setup_object_dictionary(self, node, base_index):
+        """
+        Dynamically adds the state objects to the node's object dictionary in the `canopen` library.
+        Called by DeviceManager during entity creation.
+        """
         super().setup_object_dictionary(node, base_index)
         state_map = []
         index = base_index + 1
@@ -116,9 +107,20 @@ class StateMixin:
 
 
 class CommandMixin:
+    """
+    A mixin for entities that accept commands from Home Assistant to the CANopen device.
+    It manages the mapping between MQTT command topics and CANopen SDO write requests.
+    """
     _mqtt_cmd_topic2entity = dict()
 
     def commands(self):
+        """
+        Defines the command properties of this entity.
+        Each yielded tuple defines:
+        1. The key in the MQTT discovery config (e.g., "command_topic").
+        2. A function to parse the value from MQTT (e.g., onoff2bool).
+        3. The CANopen data type (e.g., datatypes.UNSIGNED8).
+        """
         yield "command_topic", int, datatypes.UNSIGNED8
 
     @cached_property
@@ -130,9 +132,17 @@ class CommandMixin:
 
     @classmethod
     def get_entity_by_cmd_topic(cls, cmd_topic):
+        """
+        Finds which entity should handle a command from a given MQTT topic.
+        Called by the MqttManager when a message is received.
+        """
         return cls._mqtt_cmd_topic2entity.get(cmd_topic)
 
     def setup_command_topics(self, command_map):
+        """
+        Registers this entity instance to handle commands from specific MQTT topics.
+        - `command_map`: A list of integer keys for the command objects this entity can write to.
+        """
         self.command_map = command_map
         self._topic2cmdkey = {}
         for cmd_key in self.command_map:
@@ -141,6 +151,7 @@ class CommandMixin:
             self._topic2cmdkey[topic] = cmd_key
 
     def get_mqtt_config(self):
+        """Adds the command topics to the Home Assistant discovery payload."""
         config = super(CommandMixin, self).get_mqtt_config()
         assert len(self.COMMANDS) == len(self.command_map)
         for (topic, *_), cmd_key in zip(self.COMMANDS, self.command_map):
@@ -148,9 +159,16 @@ class CommandMixin:
         return config
 
     def get_mqtt_command_topic(self, cmd_key):
+        """Generates the unique MQTT topic for a given command object."""
         return f"{self.mqtt_topic_prefix}/can_cmd_{self.node.id:03x}_{cmd_key:08x}"
 
     def get_can_cmd(self, topic, value):
+        """
+        Parses an incoming MQTT message into a CANopen SDO write request.
+        - `topic`: The MQTT topic the message was received on.
+        - `value`: The raw payload from MQTT (e.g., b'ON').
+        - Returns: A tuple of (canopen_object_key, formatted_value).
+        """
         cmd_key = self._topic2cmdkey and self._topic2cmdkey.get(topic)
         if not cmd_key:
             raise ValueError(f"topic {topic} is not recognized")
@@ -158,6 +176,10 @@ class CommandMixin:
         return cmd_key, self.COMMANDS[index][1](value)
 
     def setup_object_dictionary(self, node, base_index):
+        """
+        Dynamically adds the command objects to the node's object dictionary.
+        Called by DeviceManager during entity creation.
+        """
         super().setup_object_dictionary(node, base_index)
         cmd_map = []
         index = base_index + 2
@@ -171,6 +193,7 @@ class CommandMixin:
 
 
 class Entity:
+    """Base class for all Home Assistant entities bridged from CANopen."""
     _entities = {}
     NAME_PROP = 1
     TYPE_ID = None
@@ -191,7 +214,6 @@ class Entity:
         self.mqtt_topic_prefix = mqtt_topic_prefix
         self.caps = caps
 
-        # TODO: add some canbus id part to allow for many can busses
         self.unique_id = f"can_{self.node.id:03x}_{self.entity_index:02x}"
         self.props = {}
         self._entities[self.unique_id] = self
@@ -208,32 +230,42 @@ class Entity:
     def remove_entity(cls, unique_id):
         cls._entities.pop(unique_id, None)
 
-    async def publish_config(self, mqtt_client):
+    async def publish_config(self, mqtt_manager: MqttManager):
+        """
+        Publishes the Home Assistant MQTT discovery configuration for this entity.
+        Called by DeviceManager after an entity is created or reconfigured.
+        """
         config_topic = self.get_mqtt_config_topic()
         config_payload = self.get_mqtt_config()
         logger.debug("mqtt config_topic: %r, payload: %r", config_topic, config_payload)
-        await mqtt_client.publish(
+        await mqtt_manager.publish(
             config_topic, payload=json.dumps(config_payload), retain=False
         )
 
-    async def delete_config(self, mqtt_client):
+    async def remove_config(self, mqtt_manager: MqttManager):
+        """
+        Removes the Home Assistant MQTT discovery configuration for this entity.
+        This is done by publishing an empty payload to the config topic.
+        """
         config_topic = self.get_mqtt_config_topic()
-        logger.debug("delete mqtt config_topic: %r", config_topic)
-        await mqtt_client.publish(config_topic, payload=None, retain=False)
-
-    async def remove_config(self, mqtt_client):
-        config_topic = self.get_mqtt_config_topic()
-        await mqtt_client.publish(config_topic, payload=b"", retain=False)
+        await mqtt_manager.publish(config_topic, payload=b"", retain=False)
 
     def set_property(self, key, value):
         self.props[key] = value
 
     def get_mqtt_config_topic(self):
+        """
+        Generates the MQTT discovery topic string for this entity.
+        Example: homeassistant/light/can_01a_01/config
+        """
         return f"{self.mqtt_topic_prefix}/{self.TYPE_NAME}/{self.unique_id}/config"
 
     def get_mqtt_config(self):
+        """
+        Assembles the full discovery payload dictionary for Home Assistant.
+        This includes availability, device info, and entity-specific properties.
+        """
         cfg = {
-            # "object_id": self.unique_id,
             "unique_id": self.unique_id,
             "availability": [
                 {
@@ -289,20 +321,30 @@ class Entity:
         else:
             logger.warning("	unknown metadata property %s: %s", key, value)
 
-    async def mqtt_initial_publish(self, _mqtt_client):
+    async def mqtt_initial_publish(self, mqtt_manager: MqttManager):
+        """
+        Hook for entities to publish their initial state after configuration.
+        Called by MqttManager on a Home Assistant status request.
+        """
         pass
 
 
 class EntityRegistry:
+    """A registry that maps (TYPE_ID, VERSION) tuples to entity classes."""
     _by_type = {}
 
     @classmethod
     def register(cls, entity_class):
+        """Decorator to register a new entity class."""
         cls._by_type[(entity_class.TYPE_ID, entity_class.VERSION)] = entity_class
         return entity_class
 
     @classmethod
     def create(cls, type_id, node, entity_index, mqtt_topic_prefix, version_override=None):
+        """
+        Factory method to create an entity instance based on its type and version.
+        Called by DeviceManager during entity discovery.
+        """
         version = (type_id >> 8) & 0xFF if version_override is None else version_override
         caps = (type_id >> 16) & 0xFFFF
         type_id = type_id & 0xFF
@@ -314,416 +356,72 @@ class EntityRegistry:
 
 
 
-def float_to_str(value):
-    return not math.isnan(value) and str(value) or ""
-
-
-@EntityRegistry.register
-class Sensor(StateMixin, Entity):
-    TYPE_ID = 1
-    TYPE_NAME = "sensor"
-
-    def states(self):
-        yield "state_topic", float_to_str, datatypes.REAL32
-
-    def canopen_metadata_properties(self):
-        yield from super().canopen_metadata_properties()
-        yield 3, "unit_of_measurement"
-        yield 4, "state_class"
-
-    def setup_object_dictionary(self, node: RemoteNode, base_index):
-        super().setup_object_dictionary(node, base_index)
-        logger.info("sensor, setup od")
-        node.object_dictionary[base_index].add_member(
-            OctetString("unit_of_measurement", base_index, 3)
-        )
-        node.object_dictionary[base_index].add_member(
-            OctetString("state_class", base_index, 4)
-        )
-
-
-class MinMaxValueMixin:
-    def canopen_metadata_properties(self):
-        yield from super().canopen_metadata_properties()
-        yield 7, "min_value"
-        yield 8, "max_value"
-
-    def setup_object_dictionary(self, node, base_index):
-        super().setup_object_dictionary(node, base_index)
-        logger.info("min max, setup od")
-        v = ODVariable("meta_min_value", base_index, 7)
-        v.data_type = datatypes.REAL32
-        node.object_dictionary[base_index].add_member(v)
-        v = ODVariable("meta_min_value", base_index, 8)
-        v.data_type = datatypes.REAL32
-        node.object_dictionary[base_index].add_member(v)
-
-    def get_mqtt_state(self, state_key, value):
-        if value == self.N_LEVELS:
-            value2 = math.nan
-        else:
-            min_val = self.props.get("min_value", 0)
-            max_val = self.props.get("max_value", self.N_LEVELS - 1)
-            value2 = scale_from_wire(value, min_val, max_val, self.N_LEVELS)
-        return super().get_mqtt_state(state_key, value2)
-
-    # TODO: add scaling for commands in get_can_cmd
-
-
-@EntityRegistry.register
-class Sensor8(MinMaxValueMixin, Sensor):
-    TYPE_ID = 6
-    TYPE_NAME = "sensor"
-    N_LEVELS = 255
-
-    def states(self):
-        yield "state_topic", float_to_str, datatypes.UNSIGNED8
-
-
-@EntityRegistry.register
-class Sensor16(MinMaxValueMixin, Sensor):
-    TYPE_ID = 7
-    TYPE_NAME = "sensor"
-    N_LEVELS = 65535
-
-    def states(self):
-        yield "state_topic", float_to_str, datatypes.UNSIGNED16
-
-
-@EntityRegistry.register
-class BinarySensor(StateMixin, Entity):
-    TYPE_ID = 2
-    TYPE_NAME = "binary_sensor"
-
-    def states(self):
-        yield "state_topic", bool2onoff, datatypes.UNSIGNED8
-
-
-@EntityRegistry.register
-class Switch(StateMixin, CommandMixin, Entity):
-    TYPE_ID = 3
-    TYPE_NAME = "switch"
-    PROPS = {"assumed_state": False}
-
-    def states(self):
-        yield "state_topic", bool2onoff, datatypes.UNSIGNED8
-
-    def commands(self):
-        yield "command_topic", onoff2bool, datatypes.UNSIGNED8
-
 
 @EntityRegistry.register
 class SimpleLight(StateMixin, CommandMixin, Entity):
+    """
+    Represents a simple On/Off light.
+    - Listens for state changes from the device (via StateMixin).
+    - Sends on/off commands to the device (via CommandMixin).
+    """
     TYPE_ID = 5
-    VERSION = 0 # This will be the default for type_id 5
+    VERSION = 0
     TYPE_NAME = "light"
 
     PROPS = {"assumed_state": False}
 
     def states(self):
+        """Defines that this light's state is a single boolean (ON/OFF)."""
         yield "state_topic", bool2onoff, datatypes.UNSIGNED8
 
     def commands(self):
+        """Defines that this light accepts a single boolean (ON/OFF) command."""
         yield "command_topic", onoff2bool, datatypes.UNSIGNED8
 
-
-@EntityRegistry.register
-class DimmableLight(StateMixin, CommandMixin, Entity):
-    TYPE_ID = 5
-    VERSION = 2 # Changed from 0 to preserve this for more advanced lights
-    TYPE_NAME = "light"
-
-    PROPS = {"assumed_state": False, "supported_color_modes": ["color_temp"]}
-
-    def states(self):
-        yield "state_topic", bool2onoff, datatypes.UNSIGNED8
-        yield "brightness_state_topic", brightness_from_wire, datatypes.UNSIGNED8
-        yield "color_temp_state_topic", color_temp_from_wire, datatypes.UNSIGNED8
-
-    def commands(self):
-        yield "command_topic", onoff2bool, datatypes.UNSIGNED8
-        yield "brightness_command_topic", brightness_to_wire, datatypes.UNSIGNED8
-        yield "color_temp_command_topic", color_temp_to_wire, datatypes.UNSIGNED8
-
-    def canopen_metadata_properties(self):
-        yield from super().canopen_metadata_properties()
-        yield 7, "min_mireds"
-        yield 8, "max_mireds"
-
-    def setup_object_dictionary(self, node, base_index):
-        super().setup_object_dictionary(node, base_index)
-        # let's reuse 7 and 8 indices for min/max mireds
-        v = ODVariable("min_mireds", base_index, 7)
-        v.data_type = datatypes.REAL32
-        node.object_dictionary[base_index].add_member(v)
-        v = ODVariable("max_mireds", base_index, 8)
-        v.data_type = datatypes.REAL32
-        node.object_dictionary[base_index].add_member(v)
-
-
-@EntityRegistry.register
-class LightV1(StateMixin, CommandMixin, Entity):
-    TYPE_ID = 5
-    VERSION = 1
-    TYPE_NAME = "light"
-
-    def states(self):
-        yield ("state_topic", bool2onoff, datatypes.UNSIGNED8)
-        if self.supports_brightness():
-            yield ("brightness_state_topic", brightness_from_wire, datatypes.UNSIGNED8)
-        if self.supports_color_temp():
-            yield ("color_temp_state_topic", color_temp_from_wire, datatypes.UNSIGNED8)
-
-    def commands(self):
-        yield ("command_topic", onoff2bool, datatypes.UNSIGNED8)
-        if self.supports_brightness():
-            yield ("brightness_command_topic", brightness_to_wire, datatypes.UNSIGNED8)
-        if self.supports_color_temp():
-            yield ("color_temp_command_topic", color_temp_to_wire, datatypes.UNSIGNED8)
-
-    def canopen_metadata_properties(self):
-        yield from super().canopen_metadata_properties()
-        if self.supports_color_temp():
-            yield 7, "min_mireds"
-            yield 8, "max_mireds"
-
-    def get_props(self):
-        color_modes = {
-            1: "onoff",
-            2: "brightness",
-            4: "color_temp",
-        }
-
-        supported_color_modes = [v for k, v in color_modes.items() if self.caps & k]
-
-        yield "supported_color_modes", supported_color_modes
-
-    @cached_property
-    def PROPS(self):
-        return dict(self.get_props())
-
-    def supports_brightness(self):
-        return self.caps & (4 | 2)
-
-    def supports_color_temp(self):
-        return self.caps & 4
-
-    def setup_object_dictionary(self, node, base_index):
-        super().setup_object_dictionary(node, base_index)
-        # let's reuse 7 and 8 indices for min/max mireds
-        v = ODVariable("min_mireds", base_index, 7)
-        v.data_type = datatypes.REAL32
-        node.object_dictionary[base_index].add_member(v)
-        v = ODVariable("max_mireds", base_index, 8)
-        v.data_type = datatypes.REAL32
-        node.object_dictionary[base_index].add_member(v)
-
-
-@EntityRegistry.register
-class Cover(StateMixin, CommandMixin, Entity):
-    TYPE_ID = 4
-    TYPE_NAME = "cover"
-
-    PROPS = {
-        "position_closed": 0,
-        "position_open": 100,
-    }
-
-    STATES_DICT = {
-        0: "open",
-        1: "opening",
-        2: "closed",
-        3: "closing",
-    }
-
-    CMDS = {
-        b"STOP": 0,
-        b"OPEN": 1,
-        b"CLOSE": 2,
-    }
-
-    def states(self):
-        yield "state_topic", self.STATES_DICT.get, datatypes.UNSIGNED8
-        yield "position_topic", percentage_from_wire, datatypes.UNSIGNED8
-
-    def commands(self):
-        yield "command_topic", self.CMDS.get, datatypes.UNSIGNED8
-        yield "set_position_topic", percentage_to_wire, datatypes.UNSIGNED8
-
-
-@EntityRegistry.register
-class CoverV1(StateMixin, CommandMixin, Entity):
-    TYPE_ID = 4
-    VERSION = 1
-    TYPE_NAME = "cover"
-
-    def get_props(self):
-        if self.caps & 1:
-            yield "position_closed", 0
-            yield "position_open", 100
-
-    @cached_property
-    def PROPS(self):
-        return dict(self.get_props())
-
-    STATES_DICT = {
-        0: "open",
-        1: "opening",
-        2: "closed",
-        3: "closing",
-    }
-
-    CMDS = {
-        b"STOP": 0,
-        b"OPEN": 1,
-        b"CLOSE": 2,
-    }
-
-    def states(self):
-        yield ("state_topic", self.STATES_DICT.get, datatypes.UNSIGNED8)
-        if self.caps & 1:
-            yield ("position_topic", percentage_from_wire, datatypes.UNSIGNED8)
-        if self.caps & 2:
-            yield ("tilt_status_topic", percentage_from_wire, datatypes.UNSIGNED8)
-
-    def commands(self):
-        yield ("command_topic", self.CMDS.get, datatypes.UNSIGNED8)
-        if self.caps & 1:
-            yield ("set_position_topic", percentage_to_wire, datatypes.UNSIGNED8)
-        if self.caps & 2:
-            yield ("tilt_command_topic", percentage_to_wire, datatypes.UNSIGNED8)
-
-
-@EntityRegistry.register
-class Number(StateMixin, CommandMixin, Entity):
-    TYPE_ID = 8
-    TYPE_NAME = "number"
-
-    def states(self):
-        yield "state_topic", float_to_str, datatypes.REAL32
-
-    def commands(self):
-        yield "command_topic", float, datatypes.REAL32
-
-
-@EntityRegistry.register
-class Number8(MinMaxValueMixin, StateMixin, CommandMixin, Entity):
-    TYPE_ID = 9
-    TYPE_NAME = "number"
-    N_LEVELS = 255
-
-    def states(self):
-        yield "state_topic", float_to_str, datatypes.UNSIGNED8
-
-    def commands(self):
-        yield "command_topic", int, datatypes.UNSIGNED8
-
-
-@EntityRegistry.register
-class Number16(MinMaxValueMixin, StateMixin, CommandMixin, Entity):
-    TYPE_ID = 10
-    TYPE_NAME = "number"
-    N_LEVELS = 65535
-
-    def states(self):
-        yield "state_topic", float_to_str, datatypes.UNSIGNED16
-
-    def commands(self):
-        yield "command_topic", int, datatypes.UNSIGNED16
-
-
-ALARM_COMMANDS = {
-    b"DISARM": 0,
-    b"ARM_AWAY": 1,
-    b"ARM_HOME": 2,
-    b"ARM_NIGHT": 3,
-    b"ARM_VACATION": 4,
-    b"ARM_CUSTOM_BYPASS": 5,
-    b"TRIGGER": 127,
-}
-
-ALARM_STATES = {
-    0: b"disarmed",
-    1: b"armed_home",
-    2: b"armed_away",
-    3: b"armed_night",
-    4: b"armed_vacation",
-    5: b"armed_custom_bypass",
-    6: b"pending",
-    7: b"arming",
-    8: b"disarming",
-    9: b"triggered",
-}
-
-
-@EntityRegistry.register
-class Alarm(StateMixin, CommandMixin, Entity):
-    TYPE_ID = 16
-    TYPE_NAME = "alarm_control_panel"
-
-    def states(self):
-        yield "state_topic", ALARM_STATES.get, datatypes.UNSIGNED8
-
-    def commands(self):
-        yield "command_topic", ALARM_COMMANDS.get, datatypes.UNSIGNED8
-
-    PROPS = {
-        "assumed_state": False,
-        "code_arm_required": False,
-        "code_disarm_requried": False,
-        "code_trigger_required": False,
-    }
 
 @EntityRegistry.register
 class UnsupportedDeviceEntity(Entity):
-    """A special entity to represent an unsupported device found on the bus."""
+    """
+    A special service entity that appears in Home Assistant for a CANopen device
+    that was detected on the bus but is not defined in the addon's configuration.
+    It provides a sensor showing the device's Vendor ID and Product Code.
+    """
     TYPE_ID = 253
     VERSION = 0
     TYPE_NAME = "sensor"
-    
+
     def __init__(self, node, entity_index, mqtt_topic_prefix, caps):
-        # Override unique_id to be based on node_id only
         super().__init__(node, entity_index, mqtt_topic_prefix, caps)
         self.unique_id = f"can_unsupported_{self.node.id:03x}"
         self.vendor_id = 0
         self.product_code = 0
 
     def get_mqtt_config(self):
-        # This entity is not tied to a real CANopen device object, so we build a custom device entry
-        cfg = {
-            "unique_id": self.unique_id,
-            "name": f"Unsupported Device with Node {self.node.id}",
+        cfg = super().get_mqtt_config()
+        cfg.update({
+            "name": f"Unsupported Device (Node {self.node.id})",
             "icon": "mdi:help-rhombus-outline",
             "state_topic": f"{self.mqtt_topic_prefix}/{self.TYPE_NAME}/{self.unique_id}/state",
             "json_attributes_topic": f"{self.mqtt_topic_prefix}/{self.TYPE_NAME}/{self.unique_id}/attributes",
-            "availability": [{"topic": f"{self.mqtt_topic_prefix}/canopen2HAmqtt/status"}],
-            "device": {
-                "identifiers": [f"canopen_unsupported_node_{self.node.id}"],
-                "name": f"Unsupported CANopen Node {self.node.id}",
-                "model": "Unknown CANopen Device",
-                "manufacturer": "Unknown"
-            },
-        }
+        })
         return cfg
 
-    async def mqtt_initial_publish(self, mqtt_client):
-        """Publishes the static state and attributes for this informational sensor."""
-        # Main state now shows the most important info directly
+    async def mqtt_initial_publish(self, mqtt_manager):
+        """Publishes the device's detected IDs to MQTT for display in Home Assistant."""
         state_payload = f"VID: {hex(self.vendor_id)}, PID: {hex(self.product_code)}"
-        await mqtt_client.publish(
+        await mqtt_manager.publish(
             f"{self.mqtt_topic_prefix}/{self.TYPE_NAME}/{self.unique_id}/state",
             state_payload,
             retain=True
         )
 
-        # Attributes topic still contains all details
         attributes = {
             "node_id": self.node.id,
             "vendor_id": hex(self.vendor_id),
             "product_code": hex(self.product_code),
             "comment": "To support this device, add its vendor and product ID to the devices list in the addon configuration."
         }
-        await mqtt_client.publish(
+        await mqtt_manager.publish(
             f"{self.mqtt_topic_prefix}/{self.TYPE_NAME}/{self.unique_id}/attributes",
             json.dumps(attributes),
             retain=True
@@ -731,13 +429,21 @@ class UnsupportedDeviceEntity(Entity):
 
 @EntityRegistry.register
 class UnconfiguredDeviceEntity(CommandMixin, Entity):
+    """
+    A special service entity that appears in Home Assistant for a supported device
+    that has not yet been configured (e.g., has an empty device name).
+    It provides a text box in the Home Assistant UI to send a configuration string
+    (e.g., a name) back to the device.
+    """
     TYPE_ID = 254
     TYPE_NAME = "text"
     PROPS = {
-        "name": "Unconfigured BluePill Device",
+        "name": "Unconfigured Device",
         "icon": "mdi:new-box",
-        "placeholder": "Enter config: e.g. 'Device Name, 8 relays'",
+        "placeholder": "Enter config string (e.g., 'My New Device')",
     }
 
     def commands(self):
+        """Defines that this entity accepts a string command from Home Assistant."""
         yield "command_topic", str, datatypes.OCTET_STRING
+

@@ -1,3 +1,3 @@
-from .canopen2HAmqtt import start
+from .app import start
 
 __all__ = ["start"]
